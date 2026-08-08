@@ -6,8 +6,9 @@ function Test-CommandExists {
   return $null -ne (Get-Command $CommandName -ErrorAction SilentlyContinue)
 }
 
-if (-not (Test-CommandExists "uv")) {
-  Write-Error "Missing required command: uv"
+$hasUv = Test-CommandExists "uv"
+if (-not $hasUv) {
+  Write-Warning "uv command not found in PATH. Will attempt to use local python environment if available."
 }
 
 if (-not (Test-CommandExists "pnpm")) {
@@ -23,6 +24,18 @@ if (Test-CommandExists "livekit-server") {
   Write-Warning "livekit-server was not found. Skipping local LiveKit startup and using your configured LIVEKIT_URL instead."
 }
 
+if ($hasUv) {
+  $backendCmd = "uv run python src/agent.py dev"
+} elseif (Test-Path "$repoRoot\backend\.venv\Scripts\python.exe") {
+  $backendCmd = ".\.venv\Scripts\python.exe src/agent.py dev"
+} else {
+  $backendCmd = "python src/agent.py dev"
+}
+
+Start-Process powershell -ArgumentList "-NoExit", "-Command", "Set-Location '$repoRoot\backend'; $backendCmd"
+Start-Process powershell -ArgumentList "-NoExit", "-Command", "Set-Location '$repoRoot\frontend'; pnpm dev"
+
+Write-Host "Started backend and frontend in separate PowerShell windows."
 Start-Process powershell -ArgumentList "-NoExit", "-Command", "Set-Location '$repoRoot\backend'; uv run python src/agent.py dev"
 Start-Process powershell -ArgumentList "-NoExit", "-Command", "Set-Location '$repoRoot\frontend'; pnpm dev"
 
