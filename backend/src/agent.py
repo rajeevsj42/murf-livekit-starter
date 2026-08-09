@@ -1,3 +1,4 @@
+import json
 import logging
 
 from dotenv import load_dotenv
@@ -9,7 +10,9 @@ from livekit.agents import (
     AgentSession,
     JobContext,
     JobProcess,
+    RunContext,
     cli,
+    function_tool,
     room_io,
     tokenize,
 )
@@ -24,6 +27,16 @@ from livekit.plugins import (
 
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
+# IMPORTANT:
+# Alias database functions so they don't conflict
+# with our agent tool methods.
+
+from memory import (
+    init_db,
+    lookup_user as db_lookup_user,
+    save_user as db_save_user,
+)
+
 
 logger = logging.getLogger("agent")
 
@@ -31,7 +44,7 @@ load_dotenv(".env.local")
 
 
 # ============================================================
-# DAY 2 - AGENT PERSONALITY, JOB AND GUARDRAILS
+# SYSTEM PROMPT
 # ============================================================
 
 SYSTEM_PROMPT = """
@@ -41,6 +54,7 @@ You are Suchi, a friendly and professional voice customer
 support agent for TechFlow, a software company.
 
 Your job is to help customers with:
+
 - Account access
 - Billing questions
 - Subscription questions
@@ -82,38 +96,93 @@ If you do not know something, say that you do not know.
 Never invent an answer.
 
 
-LANGUAGE
+LANGUAGE & SCRIPT
 
-Language behavior is very important.
+Always detect the language the user is speaking and respond
+in the same language.
 
 If the user speaks English:
 Reply in English.
 
 If the user speaks Hindi:
-Reply in Hindi.
+Reply in Hindi using Devanagari script.
+
+Example:
+
+"बिल्कुल। पहले देखते हैं कि आपको पासवर्ड रीसेट ईमेल मिल रही है या नहीं।"
+
+NEVER write Hindi using English/Roman letters.
+
+Do NOT write:
+
+"Mera login nahi ho raha."
+
+Instead write:
+
+"मेरा लॉगिन नहीं हो रहा।"
 
 If the user mixes Hindi and English:
-Reply naturally in the same Hindi-English code-mixed style.
+Reply naturally using the same Hindi-English conversational style.
 
-Examples:
+Example:
 
 User:
 "Mera login nahi ho raha, password reset kaise karun?"
 
 Good response:
-"Bilkul. Pehle ye check karte hain ki aapko password reset email mil rahi hai ya nahi."
+"बिल्कुल। पहले देखते हैं कि आपको पासवर्ड रीसेट ईमेल मिल रही है या नहीं।"
 
-User:
-"My subscription ka payment fail ho gaya hai."
-
-Good response:
-"Okay. Let's check the payment issue. Kya payment karte waqt koi error message show hua?"
-
-Do not unnecessarily translate English technical terms into Hindi.
-
-Keep Hindi natural and conversational.
+Do not unnecessarily translate common English technical terms.
 
 If the user changes language, follow the user's new language.
+
+
+MEMORY
+
+You have two memory tools:
+
+1. lookup_user_memory
+2. save_user_memory
+
+At the beginning of every conversation, ALWAYS use
+lookup_user_memory before answering the user.
+
+If memory exists:
+
+- Remember the user's name.
+- Remember useful facts.
+- Use them naturally.
+- Do not invent memories.
+
+For example:
+
+"Welcome back, Ramesh. Last time we spoke about your subscription.
+How did that go?"
+
+If no memory exists:
+
+Treat the caller as a new user.
+
+Ask for their name naturally when appropriate.
+
+
+ASK BEFORE SAVING
+
+Before saving any personal information, explicitly ask
+the caller for permission.
+
+For example:
+
+"I can remember your name and a few details for your next call.
+Would you like me to save that?"
+
+Only call save_user_memory after the user clearly agrees.
+
+If the user says no:
+
+Do NOT call save_user_memory.
+
+Never save information without permission.
 
 
 GUARDRAILS
@@ -130,8 +199,8 @@ REFUSE:
 
 If a user asks for an OTP, password, API key, or secret:
 
-Say:
-"Main passwords, OTPs ya confidential information handle nahi kar sakti. Aapki security ke liye ye information share na karein."
+"मैं passwords, OTPs या confidential information handle नहीं कर सकती।
+आपकी security के लिए ये information share न करें।"
 
 
 NEVER CLAIM:
@@ -145,7 +214,7 @@ NEVER CLAIM:
 - That you contacted a human support agent.
 - That you are a human.
 
-Only describe an action as completed if the user confirms it.
+Only describe an action as completed if it actually happened.
 
 
 ESCALATION
@@ -153,13 +222,6 @@ ESCALATION
 If the issue requires account access, payment investigation,
 refund approval, cancellation, or another action you cannot perform,
 explain that a human support specialist is required.
-
-Use this naturally:
-
-"I couldn't safely resolve this request. A human support specialist
-will need to handle it because they have access to the necessary
-systems. Please contact our support team with your account email
-and issue details."
 
 
 STYLE
@@ -178,18 +240,6 @@ STYLE
 - Never sound robotic.
 
 For voice responses, prioritize natural speech over long explanations.
-
-
-GREETING
-
-When the conversation starts, introduce yourself and explain
-what you can help with.
-
-Example:
-
-"Hi, I'm Suchi from TechFlow support. I can help you with account,
-billing, subscription, or basic product issues. What can I help
-you with today?"
 """
 
 
@@ -199,10 +249,114 @@ you with today?"
 
 class Assistant(Agent):
 
-    def __init__(self) -> None:
+    def __init__(self, user_id: str) -> None:
+
+        self.user_id = user_id
+
         super().__init__(
             instructions=SYSTEM_PROMPT
         )
+
+    # ========================================================
+    # LOOKUP MEMORY
+    # ========================================================
+
+    @function_tool
+    async def lookup_user_memory(
+        self,
+        context: RunContext,
+        request: str = "",
+    ):
+        """
+        Look up the current caller's saved memory.
+
+        The application already knows the caller's real user ID.
+        The request parameter only exists so the LLM tool schema
+        contains a valid property for Groq.
+        """
+
+        logger.info(
+            f"🧠 Looking up memory for user: {self.user_id}"
+        )
+
+        user = db_lookup_user(self.user_id)
+
+        if user is None:
+
+            logger.info(
+                f"🆕 No memory found for {self.user_id}"
+            )
+
+            return "No saved memory exists for this caller."
+
+        logger.info(
+            f"✅ Memory found for {self.user_id}: {user}"
+        )
+
+        return str(user)
+
+
+    # ========================================================
+    # SAVE MEMORY
+    # ========================================================
+
+    @function_tool
+    async def save_user_memory(
+        self,
+        context: RunContext,
+        name: str,
+        language_preference: str,
+        facts: str,
+    ):
+        """
+        Save caller information after the caller explicitly
+        gives permission.
+
+        Only use this tool AFTER the caller clearly agrees.
+
+        Args:
+            name:
+                The caller's name.
+
+            language_preference:
+                The caller's preferred language.
+
+            facts:
+                Important facts in JSON format.
+        """
+
+        logger.info(
+            f"💾 Saving memory for user: {self.user_id}"
+        )
+
+        try:
+
+            facts_dict = json.loads(facts)
+
+        except json.JSONDecodeError:
+
+            logger.error(
+                "❌ Invalid JSON received for facts"
+            )
+
+            return (
+                "I couldn't save that information because "
+                "the facts were not valid JSON."
+            )
+
+        # Save using the REAL application user ID.
+        db_save_user(
+            user_id=self.user_id,
+            name=name,
+            language_preference=language_preference,
+            facts=facts_dict,
+        )
+
+        logger.info(
+            f"✅ Memory saved for user: {self.user_id}"
+        )
+
+        return "The caller's memory was saved successfully."
 
 
 # ============================================================
@@ -212,12 +366,21 @@ class Assistant(Agent):
 server = AgentServer()
 
 
+# Initialize SQLite database when backend starts.
+init_db()
+
+
 # ============================================================
 # PREWARM
 # ============================================================
 
 def prewarm(proc: JobProcess):
+
+    logger.info("🔥 Loading Silero VAD...")
+
     proc.userdata["vad"] = silero.VAD.load()
+
+    logger.info("✅ Silero VAD loaded")
 
 
 server.setup_fnc = prewarm
@@ -230,24 +393,64 @@ server.setup_fnc = prewarm
 @server.rtc_session(agent_name="my-agent")
 async def my_agent(ctx: JobContext):
 
+    logger.info("=" * 60)
     logger.info("🔥 AGENT JOB STARTED")
+    logger.info("=" * 60)
 
     ctx.log_context_fields = {
         "room": ctx.room.name,
     }
 
 
-    # --------------------------------------------------------
+    # ========================================================
+    # CONNECT TO LIVEKIT
+    # ========================================================
+
+    await ctx.connect()
+
+    logger.info(
+        f"✅ Connected to LiveKit: {ctx.room.name}"
+    )
+
+
+    # ========================================================
+    # GET CALLER
+    # ========================================================
+
+    participants = list(
+        ctx.room.remote_participants.values()
+    )
+
+    if participants:
+
+        caller = participants[0]
+
+        user_id = caller.identity
+
+    else:
+
+        # Development fallback
+        user_id = "demo_user_001"
+
+
+    logger.info(
+        f"👤 Caller detected: {user_id}"
+    )
+
+    logger.info(
+        f"🧠 Agent using memory ID: {user_id}"
+    )
+
+
+    # ========================================================
     # VOICE PIPELINE
-    # --------------------------------------------------------
+    # ========================================================
 
     session = AgentSession(
 
         # ----------------------------------------------------
         # STT - Deepgram
         # ----------------------------------------------------
-        # Multi-language recognition helps the agent understand
-        # Hindi, English and code-mixed speech.
 
         stt=deepgram.STT(
             model="nova-3",
@@ -258,10 +461,6 @@ async def my_agent(ctx: JobContext):
         # ----------------------------------------------------
         # LLM - Groq
         # ----------------------------------------------------
-        # Groq provides the fast language model.
-        #
-        # This model is multilingual and works well for
-        # conversational applications.
 
         llm=groq.LLM(
             model="llama-3.3-70b-versatile",
@@ -269,21 +468,17 @@ async def my_agent(ctx: JobContext):
 
 
         # ----------------------------------------------------
-        # TTS - Murf Falcon
+        # TTS - MURF FALCON
         # ----------------------------------------------------
-        # Hindi output:
-        # locale="hi-IN"
-        #
-        # This is what controls the language/locale of the
-        # generated speech.
 
         tts=murf.TTS(
             voice="Anisha",
-            locale="hi-IN",
             style="Conversation",
+
             tokenizer=tokenize.basic.SentenceTokenizer(
                 min_sentence_len=2
             ),
+
             text_pacing=True,
         ),
 
@@ -300,21 +495,23 @@ async def my_agent(ctx: JobContext):
     )
 
 
-    # --------------------------------------------------------
-    # CONNECT TO LIVEKIT
-    # --------------------------------------------------------
+    # ========================================================
+    # CREATE AGENT
+    # ========================================================
 
-    await ctx.connect()
+    agent = Assistant(
+        user_id=user_id
+    )
 
-    logger.info("✅ Connected to LiveKit")
 
-
-    # --------------------------------------------------------
-    # START AGENT SESSION
-    # --------------------------------------------------------
+    # ========================================================
+    # START SESSION
+    # ========================================================
 
     await session.start(
-        agent=Assistant(),
+
+        agent=agent,
+
         room=ctx.room,
 
         room_options=room_io.RoomOptions(
@@ -322,19 +519,59 @@ async def my_agent(ctx: JobContext):
             audio_input=room_io.AudioInputOptions(
 
                 noise_cancellation=lambda params: (
+
                     noise_cancellation.BVCTelephony()
+
                     if params.participant.kind
                     == rtc.ParticipantKind.PARTICIPANT_KIND_SIP
+
                     else noise_cancellation.BVC()
                 ),
-
             ),
         ),
     )
 
 
+    logger.info(
+        "🎤 Agent session started successfully"
+    )
+
+
+    # ========================================================
+    # INITIAL GREETING + MEMORY LOOKUP
+    # ========================================================
+
+    await session.generate_reply(
+
+        instructions=(
+            "Start the conversation now. "
+
+            "Before giving your greeting, "
+            "use the lookup_user_memory tool. "
+
+            "If memory exists, greet the caller naturally "
+            "using their saved name and relevant saved facts. "
+
+            "Do not invent any information. "
+
+            "If no memory exists, introduce yourself as "
+            "Suchi from TechFlow and ask how you can help."
+        )
+    )
+
+
+    logger.info(
+        "👋 Initial greeting requested"
+    )
+
+
 # ============================================================
 # RUN APPLICATION
+# ============================================================
+
+if __name__ == "__main__":
+
+    cli.run_app(server)
 # ============================================================
 
 if __name__ == "__main__":
