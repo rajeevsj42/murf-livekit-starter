@@ -3,7 +3,7 @@ import logging
 
 from dotenv import load_dotenv
 from livekit import rtc
-
+from livekit.agents import function_tool, RunContext
 from livekit.agents import (
     Agent,
     AgentServer,
@@ -358,7 +358,46 @@ class Assistant(Agent):
 
         return "The caller's memory was saved successfully."
 
+    @function_tool
+    async def lookup_plan(self, context: RunContext, plan_name: str):
+        """Look up TechFlow subscription plan information.
 
+        Use this tool whenever the user asks about the price, features,
+        or availability of a TechFlow subscription plan.
+
+        Supported plans are Basic, Pro, and Enterprise.
+
+        Args:
+            plan_name: The TechFlow subscription plan the user is asking about.
+        """
+
+        plans = {
+            "basic": {
+                "price": "₹499 per month",
+                "features": "basic product features and email support",
+            },
+            "pro": {
+                "price": "₹999 per month",
+                "features": "all standard features and priority support",
+            },
+            "enterprise": {
+                "price": "custom pricing",
+                "features": "advanced features, dedicated support, and custom solutions",
+            },
+        }
+
+        plan = plans.get(plan_name.lower().strip())
+
+        if not plan:
+            return (
+                "I couldn't find that subscription plan in the current "
+                "TechFlow plan database."
+            )
+
+        return (
+            f"{plan_name.title()} plan costs {plan['price']} and includes "
+            f"{plan['features']}."
+        )
 # ============================================================
 # LIVEKIT SERVER
 # ============================================================
@@ -571,8 +610,4 @@ async def my_agent(ctx: JobContext):
 
 if __name__ == "__main__":
 
-    cli.run_app(server)
-# ============================================================
-
-if __name__ == "__main__":
     cli.run_app(server)
