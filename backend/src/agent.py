@@ -1,9 +1,11 @@
+import asyncio
 import json
 import logging
+import os
+from urllib.parse import urlparse
 
 from dotenv import load_dotenv
-from livekit import rtc
-from livekit.agents import function_tool, RunContext
+from livekit import api, rtc
 from livekit.agents import (
     Agent,
     AgentServer,
@@ -16,7 +18,6 @@ from livekit.agents import (
     room_io,
     tokenize,
 )
-
 from livekit.plugins import (
     deepgram,
     groq,
@@ -24,12 +25,7 @@ from livekit.plugins import (
     noise_cancellation,
     silero,
 )
-
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
-
-# IMPORTANT:
-# Alias database functions so they don't conflict
-# with our agent tool methods.
 
 from memory import (
     init_db,
@@ -38,9 +34,55 @@ from memory import (
 )
 
 
+# ============================================================
+# CONFIG
+# ============================================================
+
 logger = logging.getLogger("agent")
 
 load_dotenv(".env.local")
+
+SIP_OUTBOUND_TRUNK_ID = os.getenv("SIP_OUTBOUND_TRUNK_ID")
+
+LINPHONE_SIP_URL = os.getenv(
+    "LINPHONE_SIP_URL",
+    "sip:aarush22@sip.linphone.org",
+)
+
+
+def get_linphone_sip_user() -> str:
+    """
+    Extract only the SIP username from:
+
+        sip:aarush22@sip.linphone.org
+
+    LiveKit's sip_call_to expects the SIP user/phone destination,
+    not the complete SIP URI.
+    """
+
+    try:
+        parsed = urlparse(LINPHONE_SIP_URL)
+
+        if parsed.username:
+            return parsed.username
+
+    except Exception:
+        pass
+
+    return "aarush22"
+
+
+LINPHONE_SIP_USER = get_linphone_sip_user()
+
+logger.info(
+    "Linphone SIP user configured: %s",
+    LINPHONE_SIP_USER,
+)
+
+logger.info(
+    "Linphone outbound trunk configured: %s",
+    SIP_OUTBOUND_TRUNK_ID,
+)
 
 
 # ============================================================
@@ -60,9 +102,9 @@ Your job is to help customers with:
 - Subscription questions
 - Basic product troubleshooting
 - General product information
+- Calling the customer's Linphone account when requested
 
 You are an AI voice assistant, not a human.
-
 
 OBJECTIVES
 
@@ -71,7 +113,8 @@ A successful call should:
 1. Understand the customer's problem before suggesting a solution.
 2. Provide a simple and useful solution whenever possible.
 3. Escalate problems that require human access or authority.
-
+4. If the caller explicitly asks you to call their Linphone account,
+   use the call_linphone tool.
 
 KNOWLEDGE
 
@@ -95,7 +138,6 @@ You cannot:
 If you do not know something, say that you do not know.
 Never invent an answer.
 
-
 LANGUAGE & SCRIPT
 
 Always detect the language the user is speaking and respond
@@ -107,35 +149,14 @@ Reply in English.
 If the user speaks Hindi:
 Reply in Hindi using Devanagari script.
 
-Example:
-
-"बिल्कुल। पहले देखते हैं कि आपको पासवर्ड रीसेट ईमेल मिल रही है या नहीं।"
-
 NEVER write Hindi using English/Roman letters.
-
-Do NOT write:
-
-"Mera login nahi ho raha."
-
-Instead write:
-
-"मेरा लॉगिन नहीं हो रहा।"
 
 If the user mixes Hindi and English:
 Reply naturally using the same Hindi-English conversational style.
 
-Example:
-
-User:
-"Mera login nahi ho raha, password reset kaise karun?"
-
-Good response:
-"बिल्कुल। पहले देखते हैं कि आपको पासवर्ड रीसेट ईमेल मिल रही है या नहीं।"
-
 Do not unnecessarily translate common English technical terms.
 
 If the user changes language, follow the user's new language.
-
 
 MEMORY
 
@@ -154,27 +175,15 @@ If memory exists:
 - Use them naturally.
 - Do not invent memories.
 
-For example:
-
-"Welcome back, Ramesh. Last time we spoke about your subscription.
-How did that go?"
-
 If no memory exists:
 
 Treat the caller as a new user.
-
 Ask for their name naturally when appropriate.
-
 
 ASK BEFORE SAVING
 
 Before saving any personal information, explicitly ask
 the caller for permission.
-
-For example:
-
-"I can remember your name and a few details for your next call.
-Would you like me to save that?"
 
 Only call save_user_memory after the user clearly agrees.
 
@@ -184,6 +193,26 @@ Do NOT call save_user_memory.
 
 Never save information without permission.
 
+LINPHONE CALLING
+
+If the user clearly asks you to call their Linphone account,
+use the call_linphone tool.
+
+Do not ask the user for the SIP URI if the application
+already has the configured Linphone account.
+
+The application already knows the Linphone SIP account.
+
+When the call_linphone tool succeeds:
+
+Tell the user briefly that the Linphone call was started.
+
+When it fails:
+
+Tell the user briefly that the call could not be started.
+
+Never claim that the call was answered unless the system
+actually confirms that.
 
 GUARDRAILS
 
@@ -197,12 +226,6 @@ REFUSE:
 - Requests to perform illegal activities.
 - Requests unrelated to TechFlow customer support.
 
-If a user asks for an OTP, password, API key, or secret:
-
-"मैं passwords, OTPs या confidential information handle नहीं कर सकती।
-आपकी security के लिए ये information share न करें।"
-
-
 NEVER CLAIM:
 
 - That you accessed the customer's account.
@@ -213,16 +236,15 @@ NEVER CLAIM:
 - That a bug was fixed.
 - That you contacted a human support agent.
 - That you are a human.
+- That a phone call was answered unless the system confirms it.
 
 Only describe an action as completed if it actually happened.
-
 
 ESCALATION
 
 If the issue requires account access, payment investigation,
 refund approval, cancellation, or another action you cannot perform,
 explain that a human support specialist is required.
-
 
 STYLE
 
@@ -249,9 +271,20 @@ For voice responses, prioritize natural speech over long explanations.
 
 class Assistant(Agent):
 
-    def __init__(self, user_id: str) -> None:
+    def __init__(
+        self,
+        user_id: str,
+        job_context: JobContext,
+    ) -> None:
 
         self.user_id = user_id
+
+        # RunContext does not have .room.
+        # Keep JobContext so tools can access:
+        # self.job_context.room
+        # self.job_context.api
+
+        self.job_context = job_context
 
         super().__init__(
             instructions=SYSTEM_PROMPT
@@ -268,15 +301,12 @@ class Assistant(Agent):
         request: str = "",
     ):
         """
-        Look up the current caller's saved memory.
-
-        The application already knows the caller's real user ID.
-        The request parameter only exists so the LLM tool schema
-        contains a valid property for Groq.
+        Look up saved memory for the current caller.
         """
 
         logger.info(
-            f"🧠 Looking up memory for user: {self.user_id}"
+            "Looking up memory for user: %s",
+            self.user_id,
         )
 
         user = db_lookup_user(self.user_id)
@@ -284,17 +314,19 @@ class Assistant(Agent):
         if user is None:
 
             logger.info(
-                f"🆕 No memory found for {self.user_id}"
+                "No memory found for %s",
+                self.user_id,
             )
 
             return "No saved memory exists for this caller."
 
         logger.info(
-            f"✅ Memory found for {self.user_id}: {user}"
+            "Memory found for %s: %s",
+            self.user_id,
+            user,
         )
 
         return str(user)
-
 
     # ========================================================
     # SAVE MEMORY
@@ -309,34 +341,21 @@ class Assistant(Agent):
         facts: str,
     ):
         """
-        Save caller information after the caller explicitly
-        gives permission.
-
-        Only use this tool AFTER the caller clearly agrees.
-
-        Args:
-            name:
-                The caller's name.
-
-            language_preference:
-                The caller's preferred language.
-
-            facts:
-                Important facts in JSON format.
+        Save caller information only after explicit permission.
         """
 
         logger.info(
-            f"💾 Saving memory for user: {self.user_id}"
+            "Saving memory for user: %s",
+            self.user_id,
         )
 
         try:
-
             facts_dict = json.loads(facts)
 
         except json.JSONDecodeError:
 
             logger.error(
-                "❌ Invalid JSON received for facts"
+                "Invalid JSON received for facts"
             )
 
             return (
@@ -344,7 +363,6 @@ class Assistant(Agent):
                 "the facts were not valid JSON."
             )
 
-        # Save using the REAL application user ID.
         db_save_user(
             user_id=self.user_id,
             name=name,
@@ -353,59 +371,176 @@ class Assistant(Agent):
         )
 
         logger.info(
-            f"✅ Memory saved for user: {self.user_id}"
+            "Memory saved for user: %s",
+            self.user_id,
         )
 
         return "The caller's memory was saved successfully."
 
+    # ========================================================
+    # LOOKUP PLAN
+    # ========================================================
+
     @function_tool
-    async def lookup_plan(self, context: RunContext, plan_name: str):
-        """Look up TechFlow subscription plan information.
-
-        Use this tool whenever the user asks about the price, features,
-        or availability of a TechFlow subscription plan.
-
-        Supported plans are Basic, Pro, and Enterprise.
-
-        Args:
-            plan_name: The TechFlow subscription plan the user is asking about.
+    async def lookup_plan(
+        self,
+        context: RunContext,
+        plan_name: str,
+    ):
+        """
+        Look up TechFlow subscription plan information.
         """
 
         plans = {
             "basic": {
                 "price": "₹499 per month",
-                "features": "basic product features and email support",
+                "features": (
+                    "basic product features and email support"
+                ),
             },
             "pro": {
                 "price": "₹999 per month",
-                "features": "all standard features and priority support",
+                "features": (
+                    "all standard features and priority support"
+                ),
             },
             "enterprise": {
                 "price": "custom pricing",
-                "features": "advanced features, dedicated support, and custom solutions",
+                "features": (
+                    "advanced features, dedicated support, "
+                    "and custom solutions"
+                ),
             },
         }
 
-        plan = plans.get(plan_name.lower().strip())
+        plan = plans.get(
+            plan_name.lower().strip()
+        )
 
         if not plan:
+
             return (
-                "I couldn't find that subscription plan in the current "
-                "TechFlow plan database."
+                "I couldn't find that subscription plan "
+                "in the current TechFlow plan database."
             )
 
         return (
-            f"{plan_name.title()} plan costs {plan['price']} and includes "
-            f"{plan['features']}."
+            f"{plan_name.title()} plan costs {plan['price']} "
+            f"and includes {plan['features']}."
         )
+
+    # ========================================================
+    # CALL LINPHONE
+    # ========================================================
+
+    @function_tool
+    async def call_linphone(
+        self,
+        context: RunContext,
+        request: str = "",
+    ):
+        """
+        Start an outbound SIP call to the configured Linphone account.
+
+        IMPORTANT:
+        sip_call_to must contain only the SIP user.
+
+        Correct:
+            aarush22
+
+        Incorrect:
+            sip:aarush22@sip.linphone.org
+        """
+
+        logger.info(
+            "Outbound Linphone call requested."
+        )
+
+        # ----------------------------------------------------
+        # Validate trunk
+        # ----------------------------------------------------
+
+        if not SIP_OUTBOUND_TRUNK_ID:
+
+            logger.error(
+                "SIP_OUTBOUND_TRUNK_ID is not configured."
+            )
+
+            return (
+                "The Linphone calling service is not configured."
+            )
+
+        # ----------------------------------------------------
+        # Get room from JobContext
+        # ----------------------------------------------------
+
+        room_name = self.job_context.room.name
+
+        logger.info(
+            "Dialing Linphone SIP user: %s",
+            LINPHONE_SIP_USER,
+        )
+
+        logger.info(
+            "Using outbound trunk: %s",
+            SIP_OUTBOUND_TRUNK_ID,
+        )
+
+        logger.info(
+            "Into room: %s",
+            room_name,
+        )
+
+        # ----------------------------------------------------
+        # Create SIP participant
+        # ----------------------------------------------------
+
+        try:
+
+            participant_identity = (
+                f"linphone_{self.user_id}"
+            )
+
+            request = api.CreateSIPParticipantRequest(
+                room_name=room_name,
+                sip_trunk_id=SIP_OUTBOUND_TRUNK_ID,
+                sip_call_to=LINPHONE_SIP_USER,
+                participant_identity=participant_identity,
+            )
+
+            result = (
+                await self.job_context.api.sip.create_sip_participant(
+                    request
+                )
+            )
+
+            logger.info(
+                "Linphone SIP participant created: %s",
+                result,
+            )
+
+            return (
+                "The Linphone call has been started successfully."
+            )
+
+        except Exception:
+
+            logger.exception(
+                "Failed to create outbound Linphone call."
+            )
+
+            return (
+                "I couldn't start the Linphone call because "
+                "the calling service returned an error."
+            )
+
+
 # ============================================================
 # LIVEKIT SERVER
 # ============================================================
 
 server = AgentServer()
 
-
-# Initialize SQLite database when backend starts.
 init_db()
 
 
@@ -415,11 +550,15 @@ init_db()
 
 def prewarm(proc: JobProcess):
 
-    logger.info("🔥 Loading Silero VAD...")
+    logger.info(
+        "Loading Silero VAD..."
+    )
 
     proc.userdata["vad"] = silero.VAD.load()
 
-    logger.info("✅ Silero VAD loaded")
+    logger.info(
+        "Silero VAD loaded"
+    )
 
 
 server.setup_fnc = prewarm
@@ -429,17 +568,26 @@ server.setup_fnc = prewarm
 # AGENT SESSION
 # ============================================================
 
-@server.rtc_session(agent_name="my-agent")
+@server.rtc_session(
+    agent_name="my-agent"
+)
 async def my_agent(ctx: JobContext):
 
-    logger.info("=" * 60)
-    logger.info("🔥 AGENT JOB STARTED")
-    logger.info("=" * 60)
+    logger.info(
+        "=" * 60
+    )
+
+    logger.info(
+        "AGENT JOB STARTED"
+    )
+
+    logger.info(
+        "=" * 60
+    )
 
     ctx.log_context_fields = {
         "room": ctx.room.name,
     }
-
 
     # ========================================================
     # CONNECT TO LIVEKIT
@@ -448,9 +596,9 @@ async def my_agent(ctx: JobContext):
     await ctx.connect()
 
     logger.info(
-        f"✅ Connected to LiveKit: {ctx.room.name}"
+        "Connected to LiveKit: %s",
+        ctx.room.name,
     )
-
 
     # ========================================================
     # GET CALLER
@@ -468,18 +616,17 @@ async def my_agent(ctx: JobContext):
 
     else:
 
-        # Development fallback
         user_id = "demo_user_001"
 
-
     logger.info(
-        f"👤 Caller detected: {user_id}"
+        "Caller detected: %s",
+        user_id,
     )
 
     logger.info(
-        f"🧠 Agent using memory ID: {user_id}"
+        "Agent using memory ID: %s",
+        user_id,
     )
-
 
     # ========================================================
     # VOICE PIPELINE
@@ -488,7 +635,7 @@ async def my_agent(ctx: JobContext):
     session = AgentSession(
 
         # ----------------------------------------------------
-        # STT - Deepgram
+        # STT
         # ----------------------------------------------------
 
         stt=deepgram.STT(
@@ -496,31 +643,26 @@ async def my_agent(ctx: JobContext):
             language="multi",
         ),
 
-
         # ----------------------------------------------------
-        # LLM - Groq
+        # LLM
         # ----------------------------------------------------
 
         llm=groq.LLM(
             model="llama-3.3-70b-versatile",
         ),
 
-
         # ----------------------------------------------------
-        # TTS - MURF FALCON
+        # MURF TTS
         # ----------------------------------------------------
 
         tts=murf.TTS(
             voice="Anisha",
             style="Conversation",
-
             tokenizer=tokenize.basic.SentenceTokenizer(
                 min_sentence_len=2
             ),
-
             text_pacing=True,
         ),
-
 
         # ----------------------------------------------------
         # TURN DETECTION
@@ -533,74 +675,59 @@ async def my_agent(ctx: JobContext):
         preemptive_generation=True,
     )
 
-
     # ========================================================
     # CREATE AGENT
     # ========================================================
 
     agent = Assistant(
-        user_id=user_id
+        user_id=user_id,
+        job_context=ctx,
     )
-
 
     # ========================================================
     # START SESSION
     # ========================================================
 
     await session.start(
-
         agent=agent,
-
         room=ctx.room,
-
         room_options=room_io.RoomOptions(
-
             audio_input=room_io.AudioInputOptions(
-
                 noise_cancellation=lambda params: (
-
                     noise_cancellation.BVCTelephony()
-
-                    if params.participant.kind
-                    == rtc.ParticipantKind.PARTICIPANT_KIND_SIP
-
+                    if (
+                        params.participant.kind
+                        == rtc.ParticipantKind.PARTICIPANT_KIND_SIP
+                    )
                     else noise_cancellation.BVC()
                 ),
             ),
         ),
     )
 
-
     logger.info(
-        "🎤 Agent session started successfully"
+        "Agent session started successfully"
     )
 
-
     # ========================================================
-    # INITIAL GREETING + MEMORY LOOKUP
+    # INITIAL GREETING + MEMORY
     # ========================================================
 
     await session.generate_reply(
-
         instructions=(
             "Start the conversation now. "
-
             "Before giving your greeting, "
             "use the lookup_user_memory tool. "
-
             "If memory exists, greet the caller naturally "
             "using their saved name and relevant saved facts. "
-
-            "Do not invent any information. "
-
+            "Do not invent information. "
             "If no memory exists, introduce yourself as "
             "Suchi from TechFlow and ask how you can help."
         )
     )
 
-
     logger.info(
-        "👋 Initial greeting requested"
+        "Initial greeting requested."
     )
 
 
@@ -609,5 +736,4 @@ async def my_agent(ctx: JobContext):
 # ============================================================
 
 if __name__ == "__main__":
-
     cli.run_app(server)
