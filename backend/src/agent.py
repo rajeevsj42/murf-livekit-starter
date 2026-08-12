@@ -31,6 +31,7 @@ from memory import (
     init_db,
     lookup_user as db_lookup_user,
     save_user as db_save_user,
+    create_escalation as db_create_escalation,
 )
 
 
@@ -240,12 +241,35 @@ NEVER CLAIM:
 
 Only describe an action as completed if it actually happened.
 
-ESCALATION
+HUMAN ESCALATION
 
-If the issue requires account access, payment investigation,
-refund approval, cancellation, or another action you cannot perform,
-explain that a human support specialist is required.
+Escalate to human support when:
 
+1. The caller has a payment, refund, or order dispute.
+2. The caller needs an account action that you cannot perform,
+   such as cancelling a subscription or investigating an account issue.
+
+When escalation is needed:
+
+- Explain why human support is required.
+- Tell the caller what information you want to share.
+- Ask for explicit permission before calling create_escalation.
+- Do NOT call create_escalation if permission is denied.
+- Only share useful non-sensitive information.
+- Never include passwords, OTPs, PINs, API keys, secrets,
+  full payment details, or other confidential information.
+
+After create_escalation succeeds:
+
+- Give the caller the reference ID returned by the tool.
+- Tell them the request is open.
+- Explain that a human specialist will review it.
+- Do not promise an immediate response unless the system guarantees one.
+
+NORMAL QUESTIONS
+
+Do NOT create an escalation for normal questions that you can answer,
+such as subscription prices, plan features, or basic troubleshooting.
 STYLE
 
 - Speak naturally.
@@ -380,54 +404,99 @@ class Assistant(Agent):
     # ========================================================
     # LOOKUP PLAN
     # ========================================================
-
     @function_tool
-    async def lookup_plan(
+    async def create_escalation(
         self,
         context: RunContext,
-        plan_name: str,
+        issue: str,
+        summary: str,
+        urgency: str,
+        language: str,
+        follow_up_method: str,
     ):
         """
-        Look up TechFlow subscription plan information.
+        Create a human-support request.
+
+        IMPORTANT:
+        Only call this after the caller explicitly gives
+        permission to share the described information.
         """
 
-        plans = {
-            "basic": {
-                "price": "₹499 per month",
-                "features": (
-                    "basic product features and email support"
-                ),
-            },
-            "pro": {
-                "price": "₹999 per month",
-                "features": (
-                    "all standard features and priority support"
-                ),
-            },
-            "enterprise": {
-                "price": "custom pricing",
-                "features": (
-                    "advanced features, dedicated support, "
-                    "and custom solutions"
-                ),
-            },
-        }
-
-        plan = plans.get(
-            plan_name.lower().strip()
+        logger.info(
+            f"🚨 Creating human escalation for user: {self.user_id}"
         )
 
-        if not plan:
+        # Basic urgency validation
+        urgency = urgency.lower().strip()
 
-            return (
-                "I couldn't find that subscription plan "
-                "in the current TechFlow plan database."
-            )
+        if urgency not in {"low", "medium", "high", "emergency"}:
+            urgency = "medium"
+
+        escalation_id = db_create_escalation(
+            user_id=self.user_id,
+            issue=issue,
+            summary=summary,
+            urgency=urgency,
+            language=language,
+            follow_up_method=follow_up_method,
+        )
+
+        logger.info(
+            f"✅ Escalation created: {escalation_id}"
+        )
 
         return (
-            f"{plan_name.title()} plan costs {plan['price']} "
-            f"and includes {plan['features']}."
+            f"Human support request created successfully. "
+            f"Reference ID: {escalation_id}. "
+            f"Status: open."
         )
+    @function_tool
+    async def lookup_plan(
+            self,
+            context: RunContext,
+            plan_name: str,
+        ):
+            """
+            Look up TechFlow subscription plan information.
+            """
+
+            plans = {
+                "basic": {
+                    "price": "₹499 per month",
+                    "features": (
+                        "basic product features and email support"
+                    ),
+                },
+                "pro": {
+                    "price": "₹999 per month",
+                    "features": (
+                        "all standard features and priority support"
+                    ),
+                },
+                "enterprise": {
+                    "price": "custom pricing",
+                    "features": (
+                        "advanced features, dedicated support, "
+                        "and custom solutions"
+                    ),
+                },
+            }
+
+            plan = plans.get(
+                plan_name.lower().strip()
+            )
+
+            if not plan:
+
+                return (
+                    "I couldn't find that subscription plan "
+                    "in the current TechFlow plan database."
+                )
+
+            return (
+                f"{plan_name.title()} plan costs {plan['price']} "
+                f"and includes {plan['features']}."
+            )
 
     # ========================================================
     # CALL LINPHONE
