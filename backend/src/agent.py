@@ -1,4 +1,3 @@
-import asyncio
 import json
 import logging
 import os
@@ -32,6 +31,8 @@ from memory import (
     lookup_user as db_lookup_user,
     save_user as db_save_user,
     create_escalation as db_create_escalation,
+    start_call as db_start_call,
+    end_call as db_end_call,
 )
 
 
@@ -56,9 +57,6 @@ def get_linphone_sip_user() -> str:
     Extract only the SIP username from:
 
         sip:aarush22@sip.linphone.org
-
-    LiveKit's sip_call_to expects the SIP user/phone destination,
-    not the complete SIP URI.
     """
 
     try:
@@ -107,6 +105,7 @@ Your job is to help customers with:
 
 You are an AI voice assistant, not a human.
 
+
 OBJECTIVES
 
 A successful call should:
@@ -116,6 +115,7 @@ A successful call should:
 3. Escalate problems that require human access or authority.
 4. If the caller explicitly asks you to call their Linphone account,
    use the call_linphone tool.
+
 
 KNOWLEDGE
 
@@ -139,6 +139,7 @@ You cannot:
 If you do not know something, say that you do not know.
 Never invent an answer.
 
+
 LANGUAGE & SCRIPT
 
 Always detect the language the user is speaking and respond
@@ -158,6 +159,7 @@ Reply naturally using the same Hindi-English conversational style.
 Do not unnecessarily translate common English technical terms.
 
 If the user changes language, follow the user's new language.
+
 
 MEMORY
 
@@ -181,6 +183,7 @@ If no memory exists:
 Treat the caller as a new user.
 Ask for their name naturally when appropriate.
 
+
 ASK BEFORE SAVING
 
 Before saving any personal information, explicitly ask
@@ -193,6 +196,7 @@ If the user says no:
 Do NOT call save_user_memory.
 
 Never save information without permission.
+
 
 LINPHONE CALLING
 
@@ -212,8 +216,8 @@ When it fails:
 
 Tell the user briefly that the call could not be started.
 
-Never claim that the call was answered unless the system
-actually confirms that.
+Never claim the call was answered unless the system actually confirms it.
+
 
 GUARDRAILS
 
@@ -241,6 +245,7 @@ NEVER CLAIM:
 
 Only describe an action as completed if it actually happened.
 
+
 HUMAN ESCALATION
 
 Escalate to human support when:
@@ -262,14 +267,17 @@ When escalation is needed:
 After create_escalation succeeds:
 
 - Give the caller the reference ID returned by the tool.
-- Tell them the request is open.
+- Tell the caller the request is open.
 - Explain that a human specialist will review it.
 - Do not promise an immediate response unless the system guarantees one.
+
 
 NORMAL QUESTIONS
 
 Do NOT create an escalation for normal questions that you can answer,
 such as subscription prices, plan features, or basic troubleshooting.
+
+
 STYLE
 
 - Speak naturally.
@@ -302,12 +310,6 @@ class Assistant(Agent):
     ) -> None:
 
         self.user_id = user_id
-
-        # RunContext does not have .room.
-        # Keep JobContext so tools can access:
-        # self.job_context.room
-        # self.job_context.api
-
         self.job_context = job_context
 
         super().__init__(
@@ -402,8 +404,9 @@ class Assistant(Agent):
         return "The caller's memory was saved successfully."
 
     # ========================================================
-    # LOOKUP PLAN
+    # HUMAN ESCALATION
     # ========================================================
+
     @function_tool
     async def create_escalation(
         self,
@@ -417,19 +420,23 @@ class Assistant(Agent):
         """
         Create a human-support request.
 
-        IMPORTANT:
         Only call this after the caller explicitly gives
         permission to share the described information.
         """
 
         logger.info(
-            f"🚨 Creating human escalation for user: {self.user_id}"
+            "Creating human escalation for user: %s",
+            self.user_id,
         )
 
-        # Basic urgency validation
         urgency = urgency.lower().strip()
 
-        if urgency not in {"low", "medium", "high", "emergency"}:
+        if urgency not in {
+            "low",
+            "medium",
+            "high",
+            "emergency",
+        }:
             urgency = "medium"
 
         escalation_id = db_create_escalation(
@@ -442,7 +449,8 @@ class Assistant(Agent):
         )
 
         logger.info(
-            f"✅ Escalation created: {escalation_id}"
+            "Escalation created: %s",
+            escalation_id,
         )
 
         return (
@@ -450,53 +458,58 @@ class Assistant(Agent):
             f"Reference ID: {escalation_id}. "
             f"Status: open."
         )
+
+    # ========================================================
+    # LOOKUP PLAN
+    # ========================================================
+
     @function_tool
     async def lookup_plan(
-            self,
-            context: RunContext,
-            plan_name: str,
-        ):
-            """
-            Look up TechFlow subscription plan information.
-            """
+        self,
+        context: RunContext,
+        plan_name: str,
+    ):
+        """
+        Look up TechFlow subscription plan information.
+        """
 
-            plans = {
-                "basic": {
-                    "price": "₹499 per month",
-                    "features": (
-                        "basic product features and email support"
-                    ),
-                },
-                "pro": {
-                    "price": "₹999 per month",
-                    "features": (
-                        "all standard features and priority support"
-                    ),
-                },
-                "enterprise": {
-                    "price": "custom pricing",
-                    "features": (
-                        "advanced features, dedicated support, "
-                        "and custom solutions"
-                    ),
-                },
-            }
+        plans = {
+            "basic": {
+                "price": "₹499 per month",
+                "features": (
+                    "basic product features and email support"
+                ),
+            },
+            "pro": {
+                "price": "₹999 per month",
+                "features": (
+                    "all standard features and priority support"
+                ),
+            },
+            "enterprise": {
+                "price": "custom pricing",
+                "features": (
+                    "advanced features, dedicated support, "
+                    "and custom solutions"
+                ),
+            },
+        }
 
-            plan = plans.get(
-                plan_name.lower().strip()
-            )
+        plan = plans.get(
+            plan_name.lower().strip()
+        )
 
-            if not plan:
-
-                return (
-                    "I couldn't find that subscription plan "
-                    "in the current TechFlow plan database."
-                )
+        if not plan:
 
             return (
-                f"{plan_name.title()} plan costs {plan['price']} "
-                f"and includes {plan['features']}."
+                "I couldn't find that subscription plan "
+                "in the current TechFlow plan database."
             )
+
+        return (
+            f"{plan_name.title()} plan costs {plan['price']} "
+            f"and includes {plan['features']}."
+        )
 
     # ========================================================
     # CALL LINPHONE
@@ -510,24 +523,11 @@ class Assistant(Agent):
     ):
         """
         Start an outbound SIP call to the configured Linphone account.
-
-        IMPORTANT:
-        sip_call_to must contain only the SIP user.
-
-        Correct:
-            aarush22
-
-        Incorrect:
-            sip:aarush22@sip.linphone.org
         """
 
         logger.info(
             "Outbound Linphone call requested."
         )
-
-        # ----------------------------------------------------
-        # Validate trunk
-        # ----------------------------------------------------
 
         if not SIP_OUTBOUND_TRUNK_ID:
 
@@ -538,10 +538,6 @@ class Assistant(Agent):
             return (
                 "The Linphone calling service is not configured."
             )
-
-        # ----------------------------------------------------
-        # Get room from JobContext
-        # ----------------------------------------------------
 
         room_name = self.job_context.room.name
 
@@ -559,10 +555,6 @@ class Assistant(Agent):
             "Into room: %s",
             room_name,
         )
-
-        # ----------------------------------------------------
-        # Create SIP participant
-        # ----------------------------------------------------
 
         try:
 
@@ -642,17 +634,9 @@ server.setup_fnc = prewarm
 )
 async def my_agent(ctx: JobContext):
 
-    logger.info(
-        "=" * 60
-    )
-
-    logger.info(
-        "AGENT JOB STARTED"
-    )
-
-    logger.info(
-        "=" * 60
-    )
+    logger.info("=" * 60)
+    logger.info("AGENT JOB STARTED")
+    logger.info("=" * 60)
 
     ctx.log_context_fields = {
         "room": ctx.room.name,
@@ -680,7 +664,6 @@ async def my_agent(ctx: JobContext):
     if participants:
 
         caller = participants[0]
-
         user_id = caller.identity
 
     else:
@@ -694,6 +677,18 @@ async def my_agent(ctx: JobContext):
 
     logger.info(
         "Agent using memory ID: %s",
+        user_id,
+    )
+
+    # ========================================================
+    # DAY 8 - START CALL ANALYTICS
+    # ========================================================
+
+    call_id = db_start_call(user_id)
+
+    logger.info(
+        "Call analytics started: %s for user: %s",
+        call_id,
         user_id,
     )
 
@@ -799,7 +794,93 @@ async def my_agent(ctx: JobContext):
         "Initial greeting requested."
     )
 
+    # ========================================================
+    # DAY 8 - CALL ANALYTICS
+    # ========================================================
+    #
+    # When this LiveKit job shuts down, mark the call
+    # as successful if the session completed normally.
+    #
+    # This is registered only once.
+    # ========================================================
 
+    async def record_call_outcome():
+
+        try:
+
+            db_end_call(
+                call_id,
+                "success",
+            )
+
+            logger.info(
+                "Call analytics completed: %s -> success",
+                call_id,
+            )
+
+        except Exception:
+
+            logger.exception(
+                "Failed to record call analytics: %s",
+                call_id,
+            )
+
+    ctx.add_shutdown_callback(
+        record_call_outcome
+    )
+
+    await session.start(
+        agent=agent,
+        room=ctx.room,
+        room_options=room_io.RoomOptions(
+            audio_input=room_io.AudioInputOptions(
+                noise_cancellation=lambda params: (
+                    noise_cancellation.BVCTelephony()
+                    if (
+                        params.participant.kind
+                        == rtc.ParticipantKind.PARTICIPANT_KIND_SIP
+                    )
+                    else noise_cancellation.BVC()
+                ),
+            ),
+        ),
+    )
+
+    logger.info("Agent session started successfully")
+
+    try:
+        await session.generate_reply(
+            instructions=(
+                "Start the conversation now. "
+                "Before giving your greeting, "
+                "use the lookup_user_memory tool. "
+                "If memory exists, greet the caller naturally "
+                "using their saved name and relevant saved facts. "
+                "Do not invent information. "
+                "If no memory exists, introduce yourself as "
+                "Suchi from TechFlow and ask how you can help."
+            )
+        )
+
+        logger.info("Initial greeting requested.")
+
+        # Keep the session alive until the call ends.
+        await session.wait_for_completion()
+
+        logger.info(
+            "Call completed successfully: %s",
+            call_id,
+        )
+
+    except Exception:
+        logger.exception(
+            "Call failed: %s",
+            call_id,
+        )
+        db_end_call(call_id, "failed")
+
+    else:
+        db_end_call(call_id, "success")
 # ============================================================
 # RUN APPLICATION
 # ============================================================
