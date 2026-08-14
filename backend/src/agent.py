@@ -53,12 +53,6 @@ LINPHONE_SIP_URL = os.getenv(
 
 
 def get_linphone_sip_user() -> str:
-    """
-    Extract only the SIP username from:
-
-        sip:aarush22@sip.linphone.org
-    """
-
     try:
         parsed = urlparse(LINPHONE_SIP_URL)
 
@@ -85,7 +79,7 @@ logger.info(
 
 
 # ============================================================
-# SYSTEM PROMPT
+# MAIN AGENT PROMPT
 # ============================================================
 
 SYSTEM_PROMPT = """
@@ -94,27 +88,56 @@ IDENTITY
 You are Suchi, a friendly and professional voice customer
 support agent for TechFlow, a software company.
 
+You are an AI voice assistant, not a human.
+
 Your job is to help customers with:
 
 - Account access
-- Billing questions
-- Subscription questions
 - Basic product troubleshooting
+- Subscription questions
 - General product information
+- Basic billing questions
 - Calling the customer's Linphone account when requested
 
-You are an AI voice assistant, not a human.
+You have a billing specialist agent available.
+
+If a customer has a complex billing problem, payment dispute,
+refund request, duplicate charge, incorrect charge, or other
+billing issue requiring specialist handling, hand the conversation
+to the Billing Specialist using the handoff tool.
+
+Do NOT hand off normal questions that you can answer yourself.
 
 
 OBJECTIVES
 
-A successful call should:
-
 1. Understand the customer's problem before suggesting a solution.
-2. Provide a simple and useful solution whenever possible.
-3. Escalate problems that require human access or authority.
-4. If the caller explicitly asks you to call their Linphone account,
-   use the call_linphone tool.
+2. Give a simple useful answer whenever possible.
+3. Use the billing specialist when the problem requires billing expertise.
+4. Use call_linphone when the caller explicitly asks you to call
+   their configured Linphone account.
+5. Escalate to human support when necessary.
+
+
+BILLING HANDOFF
+
+Use the handoff_to_billing_specialist tool when:
+
+- The customer disputes a payment.
+- The customer reports a duplicate charge.
+- The customer says they were charged incorrectly.
+- The customer asks for a refund that requires investigation.
+- The customer has a complicated billing problem.
+- The customer needs detailed billing investigation.
+
+Before handing off, tell the customer clearly:
+
+"I'll connect you with our billing specialist."
+
+Then use the handoff tool.
+
+The billing specialist receives the conversation context.
+Do NOT ask the customer to repeat the entire problem.
 
 
 KNOWLEDGE
@@ -123,24 +146,21 @@ You can help with:
 
 - Login and password troubleshooting
 - Subscription information
-- Billing questions
 - Basic product troubleshooting
 - General product information
+- Simple billing questions
 
 You cannot:
 
 - Access customer accounts.
 - Modify customer accounts.
 - See private customer information.
-- Process refunds.
+- Process refunds yourself.
 - Cancel subscriptions yourself.
 - Make company policy decisions.
 
-If you do not know something, say that you do not know.
-Never invent an answer.
 
-
-LANGUAGE & SCRIPT
+LANGUAGE
 
 Always detect the language the user is speaking and respond
 in the same language.
@@ -156,20 +176,13 @@ NEVER write Hindi using English/Roman letters.
 If the user mixes Hindi and English:
 Reply naturally using the same Hindi-English conversational style.
 
-Do not unnecessarily translate common English technical terms.
-
-If the user changes language, follow the user's new language.
+If the user changes language, follow the new language.
 
 
 MEMORY
 
-You have two memory tools:
-
-1. lookup_user_memory
-2. save_user_memory
-
 At the beginning of every conversation, ALWAYS use
-lookup_user_memory before answering the user.
+lookup_user_memory before answering.
 
 If memory exists:
 
@@ -186,37 +199,29 @@ Ask for their name naturally when appropriate.
 
 ASK BEFORE SAVING
 
-Before saving any personal information, explicitly ask
-the caller for permission.
+Before saving personal information, explicitly ask the caller
+for permission.
 
-Only call save_user_memory after the user clearly agrees.
+Only call save_user_memory after the caller clearly agrees.
 
-If the user says no:
-
-Do NOT call save_user_memory.
-
-Never save information without permission.
+If the caller says no:
+Do NOT save the information.
 
 
 LINPHONE CALLING
 
-If the user clearly asks you to call their Linphone account,
-use the call_linphone tool.
+If the caller clearly asks you to call their Linphone account,
+use call_linphone.
 
-Do not ask the user for the SIP URI if the application
-already has the configured Linphone account.
+Do not ask for the SIP URI because the application already knows it.
 
-The application already knows the Linphone SIP account.
-
-When the call_linphone tool succeeds:
-
-Tell the user briefly that the Linphone call was started.
+When call_linphone succeeds:
+Tell the caller briefly that the Linphone call was started.
 
 When it fails:
+Tell the caller briefly that the call could not be started.
 
-Tell the user briefly that the call could not be started.
-
-Never claim the call was answered unless the system actually confirms it.
+Never claim the call was answered unless the system confirms it.
 
 
 GUARDRAILS
@@ -225,7 +230,7 @@ REFUSE:
 
 - Requests for passwords.
 - Requests for OTPs.
-- Requests for API keys or API secrets.
+- Requests for API keys or secrets.
 - Requests for confidential information.
 - Requests to hack or bypass security.
 - Requests to perform illegal activities.
@@ -233,15 +238,15 @@ REFUSE:
 
 NEVER CLAIM:
 
-- That you accessed the customer's account.
-- That you changed their account.
-- That a refund was approved.
-- That a payment was processed.
-- That a subscription was cancelled.
-- That a bug was fixed.
-- That you contacted a human support agent.
-- That you are a human.
-- That a phone call was answered unless the system confirms it.
+- You accessed an account.
+- You changed an account.
+- A refund was approved.
+- A payment was processed.
+- A subscription was cancelled.
+- A bug was fixed.
+- You contacted a human support agent.
+- You are human.
+- A phone call was answered unless confirmed.
 
 Only describe an action as completed if it actually happened.
 
@@ -250,32 +255,36 @@ HUMAN ESCALATION
 
 Escalate to human support when:
 
-1. The caller has a payment, refund, or order dispute.
-2. The caller needs an account action that you cannot perform,
-   such as cancelling a subscription or investigating an account issue.
+1. The caller has a payment, refund, or order dispute requiring
+   human authority.
+2. The caller needs an account action you cannot perform.
 
-When escalation is needed:
+Before create_escalation:
 
 - Explain why human support is required.
 - Tell the caller what information you want to share.
-- Ask for explicit permission before calling create_escalation.
-- Do NOT call create_escalation if permission is denied.
-- Only share useful non-sensitive information.
-- Never include passwords, OTPs, PINs, API keys, secrets,
-  full payment details, or other confidential information.
+- Ask for explicit permission.
+- Do not call create_escalation without permission.
 
-After create_escalation succeeds:
+Never include:
 
-- Give the caller the reference ID returned by the tool.
-- Tell the caller the request is open.
-- Explain that a human specialist will review it.
-- Do not promise an immediate response unless the system guarantees one.
+- Passwords
+- OTPs
+- PINs
+- API keys
+- Secrets
+- Full payment details
+- Confidential information
 
 
 NORMAL QUESTIONS
 
-Do NOT create an escalation for normal questions that you can answer,
-such as subscription prices, plan features, or basic troubleshooting.
+Do NOT create an escalation or billing handoff for normal questions
+that you can answer, such as:
+
+- Subscription prices
+- Plan features
+- Basic troubleshooting
 
 
 STYLE
@@ -288,17 +297,82 @@ STYLE
 - Avoid long explanations.
 - Avoid bullet points when speaking.
 - Do not use emojis.
-- Do not use complicated formatting.
-- Avoid unnecessary technical jargon.
+- Avoid unnecessary jargon.
 - Be empathetic when the user is frustrated.
 - Never sound robotic.
 
-For voice responses, prioritize natural speech over long explanations.
+For voice responses, prioritize natural speech.
 """
 
 
 # ============================================================
-# AGENT
+# BILLING SPECIALIST
+# ============================================================
+
+class BillingSpecialist(Agent):
+
+    def __init__(
+        self,
+        chat_ctx=None,
+    ) -> None:
+
+        super().__init__(
+            instructions="""
+You are the TechFlow Billing Specialist.
+
+You specialize ONLY in billing and payment issues.
+
+Your job is to help with:
+
+- Payment problems
+- Duplicate charges
+- Incorrect charges
+- Refund questions
+- Billing disputes
+- Subscription billing problems
+
+You are continuing a conversation that was started by
+the main TechFlow support agent.
+
+The previous conversation has been passed to you.
+
+DO NOT ask the customer to repeat the entire problem.
+
+First, briefly introduce yourself:
+
+"Hi, I'm the TechFlow billing specialist. I have the context
+from Suchi, so let's continue from there."
+
+Then continue helping with the billing issue.
+
+You CANNOT:
+
+- Access customer accounts.
+- Process refunds.
+- Change payments.
+- Cancel subscriptions.
+- Access passwords.
+- Access OTPs.
+- Access API keys.
+- Access private information.
+- Make company policy decisions.
+
+If the customer asks something unrelated to billing,
+say briefly that you specialize in billing and that
+Suchi can help with other TechFlow questions.
+
+Keep responses short and natural.
+
+Ask one question at a time.
+
+Never invent billing information.
+""",
+            chat_ctx=chat_ctx,
+        )
+
+
+# ============================================================
+# MAIN AGENT
 # ============================================================
 
 class Assistant(Agent):
@@ -326,9 +400,7 @@ class Assistant(Agent):
         context: RunContext,
         request: str = "",
     ):
-        """
-        Look up saved memory for the current caller.
-        """
+        """Look up saved memory for the current caller."""
 
         logger.info(
             "Looking up memory for user: %s",
@@ -366,9 +438,7 @@ class Assistant(Agent):
         language_preference: str,
         facts: str,
     ):
-        """
-        Save caller information only after explicit permission.
-        """
+        """Save caller information only after explicit permission."""
 
         logger.info(
             "Saving memory for user: %s",
@@ -376,6 +446,7 @@ class Assistant(Agent):
         )
 
         try:
+
             facts_dict = json.loads(facts)
 
         except json.JSONDecodeError:
@@ -402,6 +473,51 @@ class Assistant(Agent):
         )
 
         return "The caller's memory was saved successfully."
+
+    # ========================================================
+    # DAY 9 - HANDOFF TO BILLING SPECIALIST
+    # ========================================================
+
+    @function_tool
+    async def handoff_to_billing_specialist(
+        self,
+        context: RunContext,
+        reason: str,
+    ):
+        """
+        Transfer the current conversation to the TechFlow
+        Billing Specialist.
+
+        Use this when the customer has a complex billing issue,
+        payment dispute, duplicate charge, incorrect charge,
+        refund request, or another billing problem requiring
+        specialist handling.
+
+        Do not use this for normal subscription-price or
+        basic product questions.
+        """
+
+        logger.info(
+            "DAY 9: Billing specialist handoff requested. "
+            "Reason: %s",
+            reason,
+        )
+
+        specialist = BillingSpecialist(
+            chat_ctx=self.chat_ctx.copy(
+                exclude_instructions=True
+            )
+        )
+
+        logger.info(
+            "DAY 9: Transferring user %s to Billing Specialist.",
+            self.user_id,
+        )
+
+        return (
+            specialist,
+            "Transferring you to our billing specialist now."
+        )
 
     # ========================================================
     # HUMAN ESCALATION
@@ -469,9 +585,7 @@ class Assistant(Agent):
         context: RunContext,
         plan_name: str,
     ):
-        """
-        Look up TechFlow subscription plan information.
-        """
+        """Look up TechFlow subscription plan information."""
 
         plans = {
             "basic": {
@@ -521,9 +635,7 @@ class Assistant(Agent):
         context: RunContext,
         request: str = "",
     ):
-        """
-        Start an outbound SIP call to the configured Linphone account.
-        """
+        """Start an outbound SIP call to the configured Linphone account."""
 
         logger.info(
             "Outbound Linphone call requested."
@@ -643,7 +755,7 @@ async def my_agent(ctx: JobContext):
     }
 
     # ========================================================
-    # CONNECT TO LIVEKIT
+    # CONNECT
     # ========================================================
 
     await ctx.connect()
@@ -675,13 +787,8 @@ async def my_agent(ctx: JobContext):
         user_id,
     )
 
-    logger.info(
-        "Agent using memory ID: %s",
-        user_id,
-    )
-
     # ========================================================
-    # DAY 8 - START CALL ANALYTICS
+    # CALL ANALYTICS
     # ========================================================
 
     call_id = db_start_call(user_id)
@@ -698,26 +805,36 @@ async def my_agent(ctx: JobContext):
 
     session = AgentSession(
 
-        # ----------------------------------------------------
-        # STT
-        # ----------------------------------------------------
-
         stt=deepgram.STT(
             model="nova-3",
             language="multi",
         ),
 
-        # ----------------------------------------------------
-        # LLM
-        # ----------------------------------------------------
-
+        # ====================================================
+        # FIXED GROQ CONFIGURATION
+        # ====================================================
+        #
+        # IMPORTANT:
+        # Do NOT write:
+        #
+        # groq.LLM(
+        #     llm=groq.LLM(...)
+        # )
+        #
+        # groq.LLM() receives the model directly.
+        #
+        # max_completion_tokens is intentionally limited
+        # because your previous Groq logs showed a TPM
+        # rate-limit of 12,000 tokens/minute.
+        #
         llm=groq.LLM(
             model="llama-3.3-70b-versatile",
+            max_completion_tokens=500,
         ),
 
-        # ----------------------------------------------------
+        # ====================================================
         # MURF TTS
-        # ----------------------------------------------------
+        # ====================================================
 
         tts=murf.TTS(
             voice="Anisha",
@@ -728,19 +845,27 @@ async def my_agent(ctx: JobContext):
             text_pacing=True,
         ),
 
-        # ----------------------------------------------------
+        # ====================================================
         # TURN DETECTION
-        # ----------------------------------------------------
+        # ====================================================
 
         turn_detection=MultilingualModel(),
 
+        # ====================================================
+        # VAD
+        # ====================================================
+
         vad=ctx.proc.userdata["vad"],
+
+        # ====================================================
+        # PREEMPTIVE GENERATION
+        # ====================================================
 
         preemptive_generation=True,
     )
 
     # ========================================================
-    # CREATE AGENT
+    # CREATE MAIN AGENT
     # ========================================================
 
     agent = Assistant(
@@ -774,81 +899,11 @@ async def my_agent(ctx: JobContext):
     )
 
     # ========================================================
-    # INITIAL GREETING + MEMORY
+    # INITIAL GREETING
     # ========================================================
-
-    await session.generate_reply(
-        instructions=(
-            "Start the conversation now. "
-            "Before giving your greeting, "
-            "use the lookup_user_memory tool. "
-            "If memory exists, greet the caller naturally "
-            "using their saved name and relevant saved facts. "
-            "Do not invent information. "
-            "If no memory exists, introduce yourself as "
-            "Suchi from TechFlow and ask how you can help."
-        )
-    )
-
-    logger.info(
-        "Initial greeting requested."
-    )
-
-    # ========================================================
-    # DAY 8 - CALL ANALYTICS
-    # ========================================================
-    #
-    # When this LiveKit job shuts down, mark the call
-    # as successful if the session completed normally.
-    #
-    # This is registered only once.
-    # ========================================================
-
-    async def record_call_outcome():
-
-        try:
-
-            db_end_call(
-                call_id,
-                "success",
-            )
-
-            logger.info(
-                "Call analytics completed: %s -> success",
-                call_id,
-            )
-
-        except Exception:
-
-            logger.exception(
-                "Failed to record call analytics: %s",
-                call_id,
-            )
-
-    ctx.add_shutdown_callback(
-        record_call_outcome
-    )
-
-    await session.start(
-        agent=agent,
-        room=ctx.room,
-        room_options=room_io.RoomOptions(
-            audio_input=room_io.AudioInputOptions(
-                noise_cancellation=lambda params: (
-                    noise_cancellation.BVCTelephony()
-                    if (
-                        params.participant.kind
-                        == rtc.ParticipantKind.PARTICIPANT_KIND_SIP
-                    )
-                    else noise_cancellation.BVC()
-                ),
-            ),
-        ),
-    )
-
-    logger.info("Agent session started successfully")
 
     try:
+
         await session.generate_reply(
             instructions=(
                 "Start the conversation now. "
@@ -858,14 +913,25 @@ async def my_agent(ctx: JobContext):
                 "using their saved name and relevant saved facts. "
                 "Do not invent information. "
                 "If no memory exists, introduce yourself as "
-                "Suchi from TechFlow and ask how you can help."
+                "Suchi from TechFlow and ask how you can help. "
+                "Keep the greeting short and natural."
             )
         )
 
-        logger.info("Initial greeting requested.")
+        logger.info(
+            "Initial greeting requested."
+        )
 
-        # Keep the session alive until the call ends.
+        # ====================================================
+        # WAIT UNTIL CALL ENDS
+        # ====================================================
+
         await session.wait_for_completion()
+
+        db_end_call(
+            call_id,
+            "success",
+        )
 
         logger.info(
             "Call completed successfully: %s",
@@ -873,14 +939,18 @@ async def my_agent(ctx: JobContext):
         )
 
     except Exception:
+
         logger.exception(
             "Call failed: %s",
             call_id,
         )
-        db_end_call(call_id, "failed")
 
-    else:
-        db_end_call(call_id, "success")
+        db_end_call(
+            call_id,
+            "failed",
+        )
+
+
 # ============================================================
 # RUN APPLICATION
 # ============================================================
